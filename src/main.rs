@@ -26,8 +26,6 @@ fn main() {
             }
             let object_id = args[3].to_string();
             let (dir_name, object_hash) = object_id.split_at(2);
-            println!("Directory Name: {}", dir_name);
-            println!("Object Hash: {}", object_hash);
 
             match fs::read_to_string(format!(".git/objects/{}/{}", dir_name, object_hash)) {
                 Ok(content) => {
