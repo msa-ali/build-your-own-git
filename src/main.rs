@@ -14,6 +14,7 @@ fn main() {
     }
 
     let command = &args[1];
+
     let result: io::Result<()> = match command.as_str() {
         "init" => commands::init::run(),
         "cat-file" => {
@@ -30,6 +31,16 @@ fn main() {
                 commands::hash_object::run(&args[3], true)
             } else {
                 eprintln!("Usage: {} hash-object [-w] <file>", args[0]);
+                process::exit(1);
+            }
+        }
+        "ls-tree" => {
+            if args.len() == 3 && args[2] != "--name-only" && args[3].len() == 20 {
+                commands::ls_tree::run(&args[3], false)
+            } else if args.len() == 4 && args[2] == "--name-only" && args[3].len() == 20 {
+                commands::ls_tree::run(&args[3], true)
+            } else {
+                eprintln!("Usage: {} ls-tree [-name-only] <tree_id>", args[0]);
                 process::exit(1);
             }
         }

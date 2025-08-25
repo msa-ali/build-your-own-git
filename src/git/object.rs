@@ -19,24 +19,7 @@ impl From<io::Error> for Error {
 }
 
 pub fn read_blob(object_id: &str) -> Result<(String, usize, Vec<u8>), Error> {
-    if object_id.len() != 40 {
-        return Err(Error::InvalidFormat(format!(
-            "Expected 40 characters. Found: {}",
-            object_id.len()
-        )));
-    }
-
-    let dir_name = &object_id[..2];
-    let object_hash = &object_id[2..];
-    let path = Path::new(".git/objects").join(dir_name).join(object_hash);
-
-    let content = fs::read(&path).map_err(Error::Io)?;
-
-    let mut decoder = ZlibDecoder::new(&content[..]);
-    let mut decompressed = Vec::new();
-    decoder
-        .read_to_end(&mut decompressed)
-        .map_err(|err| Error::Decompression(err.to_string()))?;
+    let decompressed = read_object(object_id, 40)?;
 
     // Find null byte separator
     let null_pos = decompressed
@@ -62,6 +45,33 @@ pub fn read_blob(object_id: &str) -> Result<(String, usize, Vec<u8>), Error> {
     ))
 }
 
+pub fn read_tree_object(object_id: &str) -> Result<(String, usize, Vec<u8>), Error> {
+    let decompressed = read_object(object_id, 20)?;
+
+    let null_pos = decompressed
+        .iter()
+        .position(|&byte| byte == 0)
+        .ok_or_else(|| {
+            Error::InvalidFormat(format!("No null byte found in object {}", object_id))
+        })?;
+    let header = String::from_utf8_lossy(&decompressed[..null_pos]);
+    let header_parts: Vec<&str> = header.split_whitespace().collect();
+    if header_parts.len() != 2 || header_parts[0] != "tree" {
+        return Err(Error::InvalidFormat(format!(
+            "Expected tree header in object {}, got '{}'",
+            object_id, header
+        )));
+    }
+
+    let size: usize = header_parts[1].parse().map_err(|_| {
+        Error::InvalidFormat(format!("Invalid size in header for object {}", object_id))
+    })?;
+
+    let content = decompressed[null_pos + 1..].to_vec();
+
+    Ok((header_parts[0].to_string(), size, content))
+}
+
 pub fn write_blob(blob_data: &[u8], hash: &str) -> Result<(), Error> {
     let dir_name = &hash[..2];
     let object_hash = &hash[2..];
@@ -83,4 +93,28 @@ pub fn write_blob(blob_data: &[u8], hash: &str) -> Result<(), Error> {
     fs::write(&path, &compressed).map_err(Error::Io)?;
 
     Ok(())
+}
+
+fn read_object(object_id: &str, expected_hash_size: usize) -> Result<Vec<u8>, Error> {
+    if object_id.len() != expected_hash_size {
+        return Err(Error::InvalidFormat(format!(
+            "Expected {} characters. Found: {}",
+            expected_hash_size,
+            object_id.len()
+        )));
+    }
+
+    let dir_name = &object_id[..2];
+    let object_hash = &object_id[2..];
+    let path = Path::new(".git/objects").join(dir_name).join(object_hash);
+
+    let content = fs::read(&path).map_err(Error::Io)?;
+
+    let mut decoder = ZlibDecoder::new(&content[..]);
+    let mut decompressed = Vec::new();
+    decoder
+        .read_to_end(&mut decompressed)
+        .map_err(|err| Error::Decompression(err.to_string()))?;
+
+    Ok(decompressed)
 }
