@@ -23,6 +23,16 @@ fn main() {
             }
             commands::cat_file::run(&args[3], &args[2])
         }
+        "hash-object" => {
+            if args.len() == 3 && args[2] != "-w" {
+                commands::hash_object::run(&args[2], false)
+            } else if args.len() == 4 && args[2] == "-w" {
+                commands::hash_object::run(&args[3], true)
+            } else {
+                eprintln!("Usage: {} hash-object [-w] <file>", args[0]);
+                process::exit(1);
+            }
+        }
         _ => {
             eprintln!("Unknown command: {}", command);
             process::exit(1);

@@ -1,4 +1,5 @@
-use flate2::read::ZlibDecoder;
+use flate2::read::{ZlibDecoder, ZlibEncoder};
+use flate2::Compression;
 use std::fs;
 use std::io;
 use std::io::Read;
@@ -59,4 +60,27 @@ pub fn read_blob(object_id: &str) -> Result<(String, usize, Vec<u8>), Error> {
         size,
         decompressed[null_pos + 1..].to_vec(),
     ))
+}
+
+pub fn write_blob(blob_data: &[u8], hash: &str) -> Result<(), Error> {
+    let dir_name = &hash[..2];
+    let object_hash = &hash[2..];
+    let path = Path::new(".git/objects").join(dir_name).join(object_hash);
+
+    let dir = path
+        .parent()
+        .ok_or_else(|| Error::Io(io::Error::new(io::ErrorKind::Other, "Invalid path")))?;
+    fs::create_dir_all(dir).map_err(Error::Io)?;
+
+    // Compress the blob data
+    let mut encoder = ZlibEncoder::new(&blob_data[..], Compression::default());
+    let mut compressed = Vec::new();
+    encoder
+        .read_to_end(&mut compressed)
+        .map_err(|err| Error::Io(err))?;
+
+    // Write to file
+    fs::write(&path, &compressed).map_err(Error::Io)?;
+
+    Ok(())
 }
