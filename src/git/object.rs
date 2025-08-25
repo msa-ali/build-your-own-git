@@ -46,7 +46,7 @@ pub fn read_blob(object_id: &str) -> Result<(String, usize, Vec<u8>), Error> {
 }
 
 pub fn read_tree_object(object_id: &str) -> Result<(String, usize, Vec<u8>), Error> {
-    let decompressed = read_object(object_id, 20)?;
+    let decompressed = read_object(object_id, 40)?;
 
     let null_pos = decompressed
         .iter()

@@ -35,9 +35,9 @@ fn main() {
             }
         }
         "ls-tree" => {
-            if args.len() == 3 && args[2] != "--name-only" && args[3].len() == 20 {
+            if args.len() == 3 && args[2] != "--name-only" {
                 commands::ls_tree::run(&args[3], false)
-            } else if args.len() == 4 && args[2] == "--name-only" && args[3].len() == 20 {
+            } else if args.len() == 4 && args[2] == "--name-only" {
                 commands::ls_tree::run(&args[3], true)
             } else {
                 eprintln!("Usage: {} ls-tree [-name-only] <tree_id>", args[0]);
