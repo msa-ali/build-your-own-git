@@ -17,11 +17,11 @@ fn main() {
     let result: io::Result<()> = match command.as_str() {
         "init" => commands::init::run(),
         "cat-file" => {
-            if args.len() != 4 || args[2] != "-p" {
-                eprintln!("Usage: {} cat-file -p <object_id>", args[0]);
+            if args.len() != 4 {
+                eprintln!("Usage: {} cat-file -<flag> <object_id>", args[0]);
                 process::exit(1);
             }
-            commands::cat_file::run(&args[3])
+            commands::cat_file::run(&args[3], &args[2])
         }
         _ => {
             eprintln!("Unknown command: {}", command);

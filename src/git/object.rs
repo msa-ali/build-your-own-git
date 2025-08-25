@@ -17,7 +17,7 @@ impl From<io::Error> for Error {
     }
 }
 
-pub fn read_blob(object_id: &str) -> Result<Vec<u8>, Error> {
+pub fn read_blob(object_id: &str) -> Result<(String, usize, Vec<u8>), Error> {
     if object_id.len() != 40 {
         return Err(Error::InvalidFormat(format!(
             "Expected 40 characters. Found: {}",
@@ -45,9 +45,18 @@ pub fn read_blob(object_id: &str) -> Result<Vec<u8>, Error> {
 
     // validate header
     let header = String::from_utf8_lossy(&decompressed[..null_pos]);
-    if !header.starts_with("blob ") {
+    let header_parts: Vec<&str> = header.split_whitespace().collect();
+    if header_parts.len() != 2 || header_parts[0] != "blob" {
         return Err(Error::InvalidFormat("Expected blob header".to_string()));
     }
 
-    Ok(decompressed[null_pos + 1..].to_vec())
+    let size: usize = header_parts[1]
+        .parse()
+        .map_err(|_| Error::InvalidFormat("Invalid size in header".to_string()))?;
+
+    Ok((
+        header_parts[0].to_string(),
+        size,
+        decompressed[null_pos + 1..].to_vec(),
+    ))
 }
