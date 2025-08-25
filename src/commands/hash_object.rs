@@ -18,7 +18,7 @@ pub fn run(file_path: &str, should_write: bool) -> io::Result<()> {
     hasher.update(&store);
     let hash = hasher.digest().to_string();
 
-    if !should_write {
+    if should_write {
         object::write_blob(&store, &hash)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{:?}", e)))?;
     }
