@@ -104,7 +104,7 @@ fn write_tree(directory: &Path) -> io::Result<String> {
 
 fn get_mode_for_file(file_type: &FileType) -> io::Result<&'static str> {
     if file_type.is_dir() {
-        Ok("040000")
+        Ok("40000")
     } else if file_type.is_symlink() {
         Ok("120000")
     } else if file_type.is_file() {
