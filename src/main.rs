@@ -44,6 +44,7 @@ fn main() {
                 process::exit(1);
             }
         }
+        "write-tree" => commands::write_tree::run(),
         _ => {
             eprintln!("Unknown command: {}", command);
             process::exit(1);

@@ -1,5 +1,6 @@
 use flate2::read::{ZlibDecoder, ZlibEncoder};
 use flate2::Compression;
+use sha1_smol::Sha1;
 use std::fs;
 use std::io;
 use std::io::Read;
@@ -117,4 +118,25 @@ fn read_object(object_id: &str, expected_hash_size: usize) -> Result<Vec<u8>, Er
         .map_err(|err| Error::Decompression(err.to_string()))?;
 
     Ok(decompressed)
+}
+
+pub fn create_file_hash(file_path: &str, should_write: bool) -> Result<String, Error> {
+    let content = fs::read(file_path)?;
+
+    let header = format!("blob {}\0", content.len());
+    let header_bytes = header.as_bytes();
+
+    let mut store = Vec::with_capacity(header_bytes.len() + content.len());
+    store.extend_from_slice(header_bytes);
+    store.extend_from_slice(&content);
+
+    let mut hasher = Sha1::new();
+    hasher.update(&store);
+    let hash = hasher.digest().to_string();
+
+    if should_write {
+        write_blob(&store, &hash)?;
+    }
+
+    Ok(hash)
 }
