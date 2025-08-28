@@ -12,3 +12,4 @@ flate2 = "1.0.34"    # compression
 thiserror = "1.0.38" # error handling
 sha1_smol = "1.0.1"  # sha-1 hashing
 hex = "0.4.3"
+chrono = "0.4.41"

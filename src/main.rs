@@ -45,6 +45,7 @@ fn main() {
             }
         }
         "write-tree" => commands::write_tree::run(),
+        "commit-tree" => commands::commit_tree::run(&args[2..]),
         _ => {
             eprintln!("Unknown command: {}", command);
             process::exit(1);
