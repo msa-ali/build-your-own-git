@@ -31,8 +31,12 @@ pub fn read_blob(object_id: &str) -> Result<(String, usize, Vec<u8>), Error> {
     // validate header
     let header = String::from_utf8_lossy(&decompressed[..null_pos]);
     let header_parts: Vec<&str> = header.split_whitespace().collect();
-    if header_parts.len() != 2 || header_parts[0] != "blob" {
-        return Err(Error::InvalidFormat("Expected blob header".to_string()));
+    if header_parts.len() != 2
+        || (header_parts[0] != "blob" && header_parts[0] != "tree" && header_parts[0] != "commit")
+    {
+        return Err(Error::InvalidFormat(
+            "Expected blob, tree, or commit header".to_string(),
+        ));
     }
 
     let size: usize = header_parts[1]
