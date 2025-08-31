@@ -1,11 +1,29 @@
+// Git clone command implementation
+// This module handles the complete Git clone process including:
+// - Reference discovery
+// - Pack file fetching and unpacking
+// - Side-band protocol handling
+// - Delta compression (REF_DELTA and OFS_DELTA)
+// - File checkout
+
 use flate2::read::ZlibDecoder;
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
 use reqwest;
 use sha1_smol::Sha1;
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::Path;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+// ============================================================================
+// PUBLIC API
+// ============================================================================
+
+/// Main entry point for the clone command
 pub fn run(args: &[String]) -> io::Result<()> {
     if args.len() != 2 {
         return Err(io::Error::new(
@@ -13,15 +31,15 @@ pub fn run(args: &[String]) -> io::Result<()> {
             "Invalid number of arguments",
         ));
     }
+
     let repo_url = &args[0];
     let target_dir = &args[1];
 
     println!("Cloning repository {} into {}...", repo_url, target_dir);
 
+    // Create target directory and change into it
     fs::create_dir_all(target_dir)?;
-
     let _current_dir = std::env::current_dir()?;
-
     std::env::set_current_dir(target_dir)?;
 
     // Initialize git repository structure
@@ -30,10 +48,14 @@ pub fn run(args: &[String]) -> io::Result<()> {
     // Clone the repository
     clone_repository(repo_url)?;
 
-    // Implementation of the clone command
     Ok(())
 }
 
+// ============================================================================
+// CORE CLONE LOGIC
+// ============================================================================
+
+/// Initialize basic Git repository structure
 fn init_git_repo() -> io::Result<()> {
     fs::create_dir_all(".git/objects")?;
     fs::create_dir_all(".git/refs/heads")?;
@@ -45,34 +67,42 @@ fn init_git_repo() -> io::Result<()> {
     Ok(())
 }
 
+/// Main clone orchestration function
 fn clone_repository(repo_url: &str) -> io::Result<()> {
-    // Step-1: Discover references
+    // Step 1: Discover references
     let (_, (head_ref, head_sha)) = discover_refs(repo_url)?;
     println!("Received head ref: {} and sha: {}", head_ref, head_sha);
+
+    // Update HEAD and create reference
     println!("Updating HEAD to {}", head_ref);
     fs::write(".git/HEAD", format!("ref: {}\n", head_ref))?;
+
     let ref_path = Path::new(".git").join(&head_ref);
     fs::create_dir_all(ref_path.parent().unwrap())?;
     println!("Creating reference {}", head_ref);
     fs::write(&ref_path, format!("{}\n", head_sha))?;
 
-    // Step-2: Fetching packfile
+    // Step 2: Fetch packfile
     let pack_data = fetch_packfile(repo_url, &head_sha)?;
     println!("Received packfile of size {}", pack_data.len());
 
-    // Step 3: Unpacking packfile
+    // Step 3: Unpack packfile
     println!("Unpacking packfile...");
     unpack_packfile(&pack_data)?;
 
-    // Step 4: Checking out files
+    // Step 4: Checkout files
     println!("Checking out files...");
     checkout_files(&head_sha)?;
 
     Ok(())
 }
 
+// ============================================================================
+// REFERENCE DISCOVERY
+// ============================================================================
+
+/// Discover references from the remote repository
 fn discover_refs(repo_url: &str) -> io::Result<(Vec<(String, String)>, (String, String))> {
-    // let refs_url = format!("{}/info/refs?service=git-upload-pack", repo_url);
     let refs_url = if repo_url.ends_with(".git") {
         format!("{}/info/refs?service=git-upload-pack", repo_url)
     } else {
@@ -87,14 +117,19 @@ fn discover_refs(repo_url: &str) -> io::Result<(Vec<(String, String)>, (String, 
         .header("User-Agent", "git/2.0")
         .send()
         .map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("Error writing tree: {:?}", e))
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("Error fetching refs: {:?}", e),
+            )
         })?;
+
     if !response.status().is_success() {
         return Err(io::Error::new(
             io::ErrorKind::Other,
             format!("Failed to fetch refs: {}", response.status()),
         ));
     }
+
     let body = response.text().map_err(|e| {
         io::Error::new(io::ErrorKind::Other, format!("Error parsing refs: {:?}", e))
     })?;
@@ -102,16 +137,15 @@ fn discover_refs(repo_url: &str) -> io::Result<(Vec<(String, String)>, (String, 
     parse_refs_response(&body)
 }
 
+/// Parse the refs response from git-upload-pack
 fn parse_refs_response(body: &str) -> io::Result<(Vec<(String, String)>, (String, String))> {
     let mut refs = Vec::new();
     let mut head_ref = String::new();
     let mut head_sha = String::new();
 
     for line in body.lines() {
-        // println!("processing Ref line: {}", line);
-
         if line.is_empty() || line.len() < 4 {
-            continue; // Parse pkt-line format (4-byte length prefix + data)
+            continue;
         }
 
         if line.starts_with("001e# service=git-upload-pack") || line == "0000" {
@@ -139,15 +173,15 @@ fn parse_refs_response(body: &str) -> io::Result<(Vec<(String, String)>, (String
             continue;
         }
 
+        // Look for symref=HEAD:refs/heads/master
         for field in fields {
             if field.starts_with("symref=HEAD") {
-                head_ref = field.split(":").collect::<Vec<&str>>()[1].to_string();
+                head_ref = field.split(':').collect::<Vec<&str>>()[1].to_string();
             }
         }
     }
 
     if head_sha.is_empty() {
-        println!("No HEAD reference found");
         return Err(io::Error::new(
             io::ErrorKind::Other,
             "No HEAD reference found",
@@ -157,14 +191,20 @@ fn parse_refs_response(body: &str) -> io::Result<(Vec<(String, String)>, (String
     Ok((refs, (head_ref, head_sha)))
 }
 
+// ============================================================================
+// PACK FILE FETCHING
+// ============================================================================
+
+/// Fetch packfile from the remote repository
 fn fetch_packfile(repo_url: &str, head_sha: &str) -> io::Result<Vec<u8>> {
-    // let pack_url = format!("{}/git-upload-pack", repo_url);
     let pack_url = if repo_url.ends_with(".git") {
         format!("{}/git-upload-pack", repo_url)
     } else {
         format!("{}.git/git-upload-pack", repo_url)
     };
+
     println!("Requesting pack from: {}", pack_url);
+
     let want_line = format!(
         "want {} multi_ack_detailed side-band-64k thin-pack ofs-delta\n",
         head_sha
@@ -197,6 +237,7 @@ fn fetch_packfile(repo_url: &str, head_sha: &str) -> io::Result<Vec<u8>> {
         .bytes()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
         .to_vec();
+
     Ok(pack_data)
 }
 
@@ -207,252 +248,11 @@ fn encode_pkt_line(line: &str) -> Vec<u8> {
     format!("{:04x}{}", len, line).into_bytes()
 }
 
-/// Unpack the pack file and extract all objects
-fn unpack_packfile(pack_data: &[u8]) -> io::Result<()> {
-    // Decode side-band data to get clean pack file
-    let decoded_data = decode_sideband_data(pack_data)?;
-    let pack_start = find_pack_start(&decoded_data)?;
-    let pack_data = &decoded_data[pack_start..];
+// ============================================================================
+// SIDE-BAND PROTOCOL HANDLING
+// ============================================================================
 
-    // Parse pack header
-    if pack_data.len() < 12 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Pack file too small",
-        ));
-    }
-
-    // Debug: show the first few bytes of pack data
-    // println!("Pack file first 20 bytes: {:02x?}", &pack_data[..20.min(pack_data.len())]);
-
-    // Check PACK signature
-    if &pack_data[0..4] != b"PACK" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Invalid pack signature: {:?}", &pack_data[0..4]),
-        ));
-    }
-
-    // Parse version (big-endian uint32)
-    let version = u32::from_be_bytes([pack_data[4], pack_data[5], pack_data[6], pack_data[7]]);
-    if version != 2 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Unsupported pack version: {}", version),
-        ));
-    }
-
-    // Parse object count (big-endian uint32)
-    let object_count =
-        u32::from_be_bytes([pack_data[8], pack_data[9], pack_data[10], pack_data[11]]);
-    println!("Pack contains {} objects", object_count);
-
-    // Parse objects
-    let mut offset = 12;
-    let mut objects = HashMap::new();
-    let mut objects_by_offset = HashMap::new();
-    let mut ref_delta_objects = Vec::new();
-    let mut ofs_delta_objects = Vec::new();
-
-    for i in 0..object_count {
-        println!("Processing object {}/{}", i + 1, object_count);
-        let pack_offset = offset;
-
-        // Check if we're near the end of the pack (leave space for checksum)
-        let remaining_bytes = pack_data.len().saturating_sub(offset);
-        if remaining_bytes <= 20 {
-            println!(
-                "Reached end of pack file at offset {} with {} bytes remaining",
-                offset, remaining_bytes
-            );
-            break; // We've reached the end of objects, only checksum remains
-        }
-
-        let (obj_type, obj_data, bytes_consumed) = match parse_pack_object(&pack_data[offset..]) {
-            Ok(result) => result,
-            Err(e) => {
-                println!(
-                    "Error parsing object {} at pack offset {}: {}",
-                    i + 1,
-                    offset,
-                    e
-                );
-                println!("Remaining pack data: {} bytes", pack_data.len() - offset);
-
-                // Try to skip this object and continue with the next one
-                // This is a fallback for handling complex pack formats
-                println!("Attempting to skip problematic object and continue...");
-
-                // Try to recover by looking for the next valid object header
-                println!("Attempting to recover by finding next valid object...");
-
-                let mut recovery_offset = 1;
-                let mut found_next = false;
-
-                // Look ahead up to 1000 bytes for the next valid object
-                while recovery_offset < 1000 && offset + recovery_offset < pack_data.len() - 20 {
-                    // Try to parse as a new object at this offset
-                    match parse_pack_object(&pack_data[offset + recovery_offset..]) {
-                        Ok((next_obj_type, next_obj_data, next_bytes_consumed)) => {
-                            println!(
-                                "Found valid object at offset {}, skipping {} bytes",
-                                offset + recovery_offset,
-                                recovery_offset
-                            );
-                            offset += recovery_offset;
-
-                            // Process this recovered object
-                            match next_obj_type {
-                                PackObjectType::Commit
-                                | PackObjectType::Tree
-                                | PackObjectType::Blob => {
-                                    let sha = store_object(&next_obj_type, &next_obj_data)?;
-                                    let mut full_object = Vec::new();
-                                    let header = format!(
-                                        "{} {}\0",
-                                        next_obj_type.as_str(),
-                                        next_obj_data.len()
-                                    );
-                                    full_object.extend_from_slice(header.as_bytes());
-                                    full_object.extend_from_slice(&next_obj_data);
-                                    objects.insert(sha.clone(), full_object);
-                                    objects_by_offset.insert(offset, next_obj_data);
-                                    println!("  Stored {} as {}", next_obj_type.as_str(), sha);
-                                }
-                                PackObjectType::RefDelta(base_sha) => {
-                                    println!("  Found REF_DELTA with base {}", base_sha);
-                                    ref_delta_objects.push((base_sha, next_obj_data));
-                                }
-                                PackObjectType::OfsDelta(ofs) => {
-                                    println!("  Found OFS_DELTA with offset {}", ofs);
-                                    ofs_delta_objects.push((offset, ofs, next_obj_data));
-                                }
-                            }
-
-                            offset += next_bytes_consumed;
-                            found_next = true;
-                            break;
-                        }
-                        Err(_) => {
-                            recovery_offset += 1;
-                        }
-                    }
-                }
-
-                if !found_next {
-                    println!("Could not recover, stopping at object {}", i + 1);
-                    break;
-                } else {
-                    continue; // Continue with the next iteration
-                }
-            }
-        };
-
-        match obj_type {
-            PackObjectType::Commit | PackObjectType::Tree | PackObjectType::Blob => {
-                let sha = store_object(&obj_type, &obj_data)?;
-                // For objects map, store the full object with header for delta base lookup
-                let header = format!("{} {}\0", obj_type.as_str(), obj_data.len());
-                let mut full_object = Vec::new();
-                full_object.extend_from_slice(header.as_bytes());
-                full_object.extend_from_slice(&obj_data);
-                objects.insert(sha.clone(), full_object);
-                // For offset map, store just the raw content for OFS_DELTA
-                objects_by_offset.insert(pack_offset, obj_data.clone());
-                println!("  Stored {} as {}", obj_type.as_str(), sha);
-            }
-            PackObjectType::RefDelta(base_sha) => {
-                println!("  Found REF_DELTA referencing {}", base_sha);
-                ref_delta_objects.push((base_sha, obj_data));
-            }
-            PackObjectType::OfsDelta(ofs) => {
-                println!("  Found OFS_DELTA with offset {}", ofs);
-                ofs_delta_objects.push((pack_offset, ofs, obj_data));
-            }
-        }
-
-        // if bytes_consumed > 1000 || i >= 110 { // Debug large consumptions or near the problem area
-        //     println!("  Object {} consumed {} bytes (pack offset {} -> {})",
-        //              i + 1, bytes_consumed, offset, offset + bytes_consumed);
-        // }
-        offset += bytes_consumed;
-    }
-
-    // Process REF_DELTA objects
-    println!("Processing {} REF_DELTA objects", ref_delta_objects.len());
-    for (base_sha, delta_data) in ref_delta_objects {
-        let base_object_full = if let Some(obj) = objects.get(&base_sha) {
-            obj.clone()
-        } else {
-            // Try to read from disk
-            let raw_content = read_object_raw(&base_sha)?;
-            // We need the full object, but read_object_raw returns content only
-            // This is a limitation - for now assume it's in memory
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("REF_DELTA base object {} not found in memory", base_sha),
-            ));
-        };
-
-        // Extract raw content from full object (skip header)
-        let null_pos = base_object_full
-            .iter()
-            .position(|&b| b == 0)
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "Invalid base object format")
-            })?;
-        let base_content = &base_object_full[null_pos + 1..];
-
-        let result_content = apply_delta(base_content, &delta_data)?;
-        let sha = store_raw_object(&result_content)?;
-        objects.insert(sha.clone(), result_content);
-        println!("  Applied REF_DELTA and stored as {}", sha);
-    }
-
-    // Process OFS_DELTA objects
-    println!("Processing {} OFS_DELTA objects", ofs_delta_objects.len());
-    for (pack_offset, ofs, delta_data) in ofs_delta_objects {
-        let base_offset = pack_offset - ofs;
-        println!(
-            "  OFS_DELTA at offset {} references base at offset {}",
-            pack_offset, base_offset
-        );
-
-        let base_object = match objects_by_offset.get(&base_offset) {
-            Some(obj) => obj,
-            None => {
-                println!(
-                    "  Warning: OFS_DELTA base object not found at offset {}, skipping",
-                    base_offset
-                );
-                continue;
-            }
-        };
-
-        println!("  Base object size: {} bytes", base_object.len());
-        println!("  Delta data size: {} bytes", delta_data.len());
-
-        let result_content = apply_delta(base_object, &delta_data)?;
-        println!("  Result content size: {} bytes", result_content.len());
-
-        // We need to determine the object type to create proper header
-        // For now, let's assume it's a blob (most common for deltas)
-        let header = format!("blob {}\0", result_content.len());
-        let mut full_object = Vec::new();
-        full_object.extend_from_slice(header.as_bytes());
-        full_object.extend_from_slice(&result_content);
-
-        let sha = store_raw_object(&full_object)?;
-        objects.insert(sha.clone(), full_object.clone());
-        objects_by_offset.insert(pack_offset, result_content);
-        println!("  Applied OFS_DELTA and stored as {}", sha);
-    }
-
-    println!("Successfully unpacked {} objects", object_count);
-    Ok(())
-}
-
-/// Find where the actual pack data starts and decode side-band data
+/// Find where the actual pack data starts
 fn find_pack_start(data: &[u8]) -> io::Result<usize> {
     // Look for "PACK" signature
     for i in 0..data.len().saturating_sub(4) {
@@ -467,6 +267,7 @@ fn find_pack_start(data: &[u8]) -> io::Result<usize> {
 }
 
 /// Decode side-band data from the pack response
+/// Git uses side-band protocol to interleave pack data with progress messages
 fn decode_sideband_data(data: &[u8]) -> io::Result<Vec<u8>> {
     let mut decoded = Vec::new();
     let mut offset = 0;
@@ -503,7 +304,7 @@ fn decode_sideband_data(data: &[u8]) -> io::Result<Vec<u8>> {
                                 decoded.extend_from_slice(actual_data);
                             }
                             2 | 3 => {
-                                // Side-band 2/3: progress messages, ignore
+                                // Side-band 2/3: progress messages
                                 let message = String::from_utf8_lossy(
                                     &data[pkt_data_start + 1..pkt_data_end],
                                 );
@@ -531,35 +332,11 @@ fn decode_sideband_data(data: &[u8]) -> io::Result<Vec<u8>> {
     Ok(decoded)
 }
 
-/// Read OFS_DELTA offset using Git's variable-length encoding
-fn read_ofs_delta_offset(data: &[u8], mut offset: usize) -> io::Result<(usize, usize)> {
-    if offset >= data.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "No data for OFS_DELTA offset",
-        ));
-    }
+// ============================================================================
+// PACK FILE UNPACKING
+// ============================================================================
 
-    let mut c = data[offset];
-    offset += 1;
-    let mut ofs = (c & 0x7F) as usize;
-
-    while c & 0x80 != 0 {
-        if offset >= data.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Incomplete OFS_DELTA offset",
-            ));
-        }
-
-        c = data[offset];
-        offset += 1;
-        ofs = ((ofs + 1) << 7) + (c & 0x7F) as usize;
-    }
-
-    Ok((ofs, offset))
-}
-
+/// Pack object type enumeration
 #[derive(Debug)]
 enum PackObjectType {
     Commit,
@@ -580,6 +357,249 @@ impl PackObjectType {
     }
 }
 
+/// Unpack the pack file and extract all objects
+fn unpack_packfile(pack_data: &[u8]) -> io::Result<()> {
+    // Decode side-band data to get clean pack file
+    let decoded_data = decode_sideband_data(pack_data)?;
+    let pack_start = find_pack_start(&decoded_data)?;
+    let pack_data = &decoded_data[pack_start..];
+
+    // Validate pack header
+    if pack_data.len() < 12 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Pack file too small",
+        ));
+    }
+
+    // Check PACK signature
+    if &pack_data[0..4] != b"PACK" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Invalid pack signature: {:?}", &pack_data[0..4]),
+        ));
+    }
+
+    // Parse version (big-endian uint32)
+    let version = u32::from_be_bytes([pack_data[4], pack_data[5], pack_data[6], pack_data[7]]);
+    if version != 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Unsupported pack version: {}", version),
+        ));
+    }
+
+    // Parse object count (big-endian uint32)
+    let object_count =
+        u32::from_be_bytes([pack_data[8], pack_data[9], pack_data[10], pack_data[11]]);
+    println!("Pack contains {} objects", object_count);
+
+    // Process all objects
+    process_pack_objects(pack_data, object_count)?;
+
+    println!("Successfully unpacked {} objects", object_count);
+    Ok(())
+}
+
+/// Process all objects in the pack file
+fn process_pack_objects(pack_data: &[u8], object_count: u32) -> io::Result<()> {
+    let mut offset = 12; // Skip pack header
+    let mut objects = HashMap::new(); // SHA -> full object (with header)
+    let mut objects_by_offset = HashMap::new(); // pack offset -> raw content
+    let mut ref_delta_objects = Vec::new();
+    let mut ofs_delta_objects = Vec::new();
+
+    // First pass: process regular objects and collect deltas
+    for i in 0..object_count {
+        println!("Processing object {}/{}", i + 1, object_count);
+        let pack_offset = offset;
+
+        // Check if we're near the end of the pack (leave space for checksum)
+        let remaining_bytes = pack_data.len().saturating_sub(offset);
+        if remaining_bytes <= 20 {
+            println!(
+                "Reached end of pack file at offset {} with {} bytes remaining",
+                offset, remaining_bytes
+            );
+            break;
+        }
+
+        let (obj_type, obj_data, bytes_consumed) = match parse_pack_object(&pack_data[offset..]) {
+            Ok(result) => result,
+            Err(e) => {
+                println!(
+                    "Error parsing object {} at pack offset {}: {}",
+                    i + 1,
+                    offset,
+                    e
+                );
+                println!("Remaining pack data: {} bytes", pack_data.len() - offset);
+
+                // Try error recovery
+                if let Some((recovered_offset, recovered_obj)) =
+                    attempt_error_recovery(pack_data, offset)?
+                {
+                    offset = recovered_offset;
+                    recovered_obj
+                } else {
+                    println!("Could not recover, stopping at object {}", i + 1);
+                    break;
+                }
+            }
+        };
+
+        // Store object based on type
+        match obj_type {
+            PackObjectType::Commit | PackObjectType::Tree | PackObjectType::Blob => {
+                let sha = store_object(&obj_type, &obj_data)?;
+
+                // Store full object with header for delta base lookup
+                let header = format!("{} {}\0", obj_type.as_str(), obj_data.len());
+                let mut full_object = Vec::new();
+                full_object.extend_from_slice(header.as_bytes());
+                full_object.extend_from_slice(&obj_data);
+                objects.insert(sha.clone(), full_object);
+
+                // Store raw content for OFS_DELTA
+                objects_by_offset.insert(pack_offset, obj_data.clone());
+                println!("  Stored {} as {}", obj_type.as_str(), sha);
+            }
+            PackObjectType::RefDelta(base_sha) => {
+                println!("  Found REF_DELTA referencing {}", base_sha);
+                ref_delta_objects.push((base_sha, obj_data));
+            }
+            PackObjectType::OfsDelta(ofs) => {
+                println!("  Found OFS_DELTA with offset {}", ofs);
+                ofs_delta_objects.push((pack_offset, ofs, obj_data));
+            }
+        }
+
+        offset += bytes_consumed;
+    }
+
+    // Second pass: process delta objects
+    process_ref_deltas(ref_delta_objects, &mut objects)?;
+    process_ofs_deltas(ofs_delta_objects, &mut objects, &mut objects_by_offset)?;
+
+    Ok(())
+}
+
+/// Attempt to recover from parsing errors by finding the next valid object
+fn attempt_error_recovery(
+    pack_data: &[u8],
+    offset: usize,
+) -> io::Result<Option<(usize, (PackObjectType, Vec<u8>, usize))>> {
+    println!("Attempting to recover by finding next valid object...");
+
+    let mut recovery_offset = 1;
+
+    // Look ahead up to 1000 bytes for the next valid object
+    while recovery_offset < 1000 && offset + recovery_offset < pack_data.len() - 20 {
+        if let Ok((next_obj_type, next_obj_data, next_bytes_consumed)) =
+            parse_pack_object(&pack_data[offset + recovery_offset..])
+        {
+            println!(
+                "Found valid object at offset {}, skipping {} bytes",
+                offset + recovery_offset,
+                recovery_offset
+            );
+            return Ok(Some((
+                offset + recovery_offset,
+                (next_obj_type, next_obj_data, next_bytes_consumed),
+            )));
+        }
+        recovery_offset += 1;
+    }
+
+    Ok(None)
+}
+
+/// Process REF_DELTA objects
+fn process_ref_deltas(
+    ref_delta_objects: Vec<(String, Vec<u8>)>,
+    objects: &mut HashMap<String, Vec<u8>>,
+) -> io::Result<()> {
+    println!("Processing {} REF_DELTA objects", ref_delta_objects.len());
+
+    for (base_sha, delta_data) in ref_delta_objects {
+        let base_object_full = if let Some(obj) = objects.get(&base_sha) {
+            obj.clone()
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("REF_DELTA base object {} not found in memory", base_sha),
+            ));
+        };
+
+        // Extract raw content from full object (skip header)
+        let null_pos = base_object_full
+            .iter()
+            .position(|&b| b == 0)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "Invalid base object format")
+            })?;
+        let base_content = &base_object_full[null_pos + 1..];
+
+        let result_content = apply_delta(base_content, &delta_data)?;
+        let sha = store_raw_object(&result_content)?;
+        objects.insert(sha.clone(), result_content);
+        println!("  Applied REF_DELTA and stored as {}", sha);
+    }
+
+    Ok(())
+}
+
+/// Process OFS_DELTA objects
+fn process_ofs_deltas(
+    ofs_delta_objects: Vec<(usize, usize, Vec<u8>)>,
+    objects: &mut HashMap<String, Vec<u8>>,
+    objects_by_offset: &mut HashMap<usize, Vec<u8>>,
+) -> io::Result<()> {
+    println!("Processing {} OFS_DELTA objects", ofs_delta_objects.len());
+
+    for (pack_offset, ofs, delta_data) in ofs_delta_objects {
+        let base_offset = pack_offset - ofs;
+        println!(
+            "  OFS_DELTA at offset {} references base at offset {}",
+            pack_offset, base_offset
+        );
+
+        let base_object = match objects_by_offset.get(&base_offset) {
+            Some(obj) => obj,
+            None => {
+                println!(
+                    "  Warning: OFS_DELTA base object not found at offset {}, skipping",
+                    base_offset
+                );
+                continue;
+            }
+        };
+
+        println!("  Base object size: {} bytes", base_object.len());
+        println!("  Delta data size: {} bytes", delta_data.len());
+
+        let result_content = apply_delta(base_object, &delta_data)?;
+        println!("  Result content size: {} bytes", result_content.len());
+
+        // Create full object with blob header (most common for deltas)
+        let header = format!("blob {}\0", result_content.len());
+        let mut full_object = Vec::new();
+        full_object.extend_from_slice(header.as_bytes());
+        full_object.extend_from_slice(&result_content);
+
+        let sha = store_raw_object(&full_object)?;
+        objects.insert(sha.clone(), full_object.clone());
+        objects_by_offset.insert(pack_offset, result_content);
+        println!("  Applied OFS_DELTA and stored as {}", sha);
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// PACK OBJECT PARSING
+// ============================================================================
+
 /// Parse a single object from the pack file
 fn parse_pack_object(data: &[u8]) -> io::Result<(PackObjectType, Vec<u8>, usize)> {
     if data.is_empty() {
@@ -593,21 +613,12 @@ fn parse_pack_object(data: &[u8]) -> io::Result<(PackObjectType, Vec<u8>, usize)
     let first_byte = data[offset];
     offset += 1;
 
-    // Extract object type (bits 6-4)
+    // Extract object type (bits 6-4) and initial size (bits 3-0)
     let obj_type_num = (first_byte >> 4) & 0x07;
-
-    // Extract size (variable length encoding)
     let mut size = (first_byte & 0x0F) as usize;
     let mut shift = 4;
 
-    // Debug output for the first few objects to understand the encoding
-    // if offset <= 20 { // Debug first object
-    //     println!("DEBUG: First object - First byte: 0x{:02x}, type: {}, initial size: {}",
-    //              first_byte, obj_type_num, size);
-    //     println!("DEBUG: Next few bytes: {:02x?}", &data[1..8.min(data.len())]);
-    // }
-
-    // Continue reading size if MSB is set
+    // Continue reading size if MSB is set (variable-length encoding)
     let mut current_byte = first_byte;
     while current_byte & 0x80 != 0 {
         if offset >= data.len() {
@@ -672,18 +683,9 @@ fn parse_pack_object(data: &[u8]) -> io::Result<(PackObjectType, Vec<u8>, usize)
 
     // Decompress object data
     let compressed_data = &data[offset..];
-
-    // Debug output for problematic decompression
-    // if compressed_data.len() < 10 {
-    //     println!("DEBUG: Compressed data has only {} bytes", compressed_data.len());
-    //     println!("DEBUG: First few bytes: {:02x?}", &compressed_data[..compressed_data.len().min(8)]);
-    // }
-
-    // Use the original approach with total_in() which is more reliable
     let mut decoder = ZlibDecoder::new(compressed_data);
     let mut decompressed = Vec::new();
 
-    // Read the decompressed data
     decoder.read_to_end(&mut decompressed).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -694,14 +696,13 @@ fn parse_pack_object(data: &[u8]) -> io::Result<(PackObjectType, Vec<u8>, usize)
         )
     })?;
 
-    // Verify the decompressed size matches expected (but don't fail if it's close)
+    // Verify the decompressed size matches expected (with tolerance for minor differences)
     if decompressed.len() != size {
         println!(
             "Warning: Size mismatch for object - expected {}, got {}",
             size,
             decompressed.len()
         );
-        // Only fail if the difference is significant
         if (decompressed.len() as i64 - size as i64).abs() > 1000 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -717,72 +718,43 @@ fn parse_pack_object(data: &[u8]) -> io::Result<(PackObjectType, Vec<u8>, usize)
     // Calculate how many compressed bytes were consumed
     let total_in = decoder.total_in() as usize;
 
-    // Debug output for the first few objects
-    // if offset <= 20 {
-    //     println!("DEBUG: Object consumed {} compressed bytes, decompressed to {} bytes",
-    //              total_in, decompressed.len());
-    //     println!("DEBUG: Header offset: {}, total consumed: {}", offset, offset + total_in);
-    // }
-
     Ok((obj_type, decompressed, offset + total_in))
 }
 
-/// Store an object in the Git object database
-fn store_object(obj_type: &PackObjectType, data: &[u8]) -> io::Result<String> {
-    let header = format!("{} {}\0", obj_type.as_str(), data.len());
-    let mut full_object = Vec::new();
-    full_object.extend_from_slice(header.as_bytes());
-    full_object.extend_from_slice(data);
+/// Read OFS_DELTA offset using Git's variable-length encoding
+fn read_ofs_delta_offset(data: &[u8], mut offset: usize) -> io::Result<(usize, usize)> {
+    if offset >= data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "No data for OFS_DELTA offset",
+        ));
+    }
 
-    store_raw_object(&full_object)
+    let mut c = data[offset];
+    offset += 1;
+    let mut ofs = (c & 0x7F) as usize;
+
+    while c & 0x80 != 0 {
+        if offset >= data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Incomplete OFS_DELTA offset",
+            ));
+        }
+
+        c = data[offset];
+        offset += 1;
+        ofs = ((ofs + 1) << 7) + (c & 0x7F) as usize;
+    }
+
+    Ok((ofs, offset))
 }
 
-/// Store raw object data (with header) in the Git object database
-fn store_raw_object(data: &[u8]) -> io::Result<String> {
-    // Calculate SHA1
-    let mut hasher = Sha1::new();
-    hasher.update(data);
-    let sha = hasher.digest().to_string();
+// ============================================================================
+// DELTA COMPRESSION
+// ============================================================================
 
-    // Write to .git/objects/xx/xxxxxx...
-    let dir = format!(".git/objects/{}", &sha[..2]);
-    fs::create_dir_all(&dir)?;
-
-    let path = format!("{}/{}", dir, &sha[2..]);
-
-    // Compress and write
-    use flate2::write::ZlibEncoder;
-    use flate2::Compression;
-    use std::io::Write;
-
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(data)?;
-    let compressed = encoder.finish()?;
-
-    fs::write(&path, compressed)?;
-
-    Ok(sha)
-}
-
-/// Read an object from the Git object database
-fn read_object_raw(sha: &str) -> io::Result<Vec<u8>> {
-    let path = format!(".git/objects/{}/{}", &sha[..2], &sha[2..]);
-    let compressed = fs::read(&path)?;
-
-    let mut decoder = ZlibDecoder::new(&compressed[..]);
-    let mut decompressed = Vec::new();
-    decoder.read_to_end(&mut decompressed)?;
-
-    // Find null byte to skip header
-    let null_pos = decompressed
-        .iter()
-        .position(|&b| b == 0)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid object format"))?;
-
-    Ok(decompressed[null_pos + 1..].to_vec())
-}
-
-/// Apply a delta to a base object
+/// Apply a delta to a base object to reconstruct the target object
 fn apply_delta(base: &[u8], delta: &[u8]) -> io::Result<Vec<u8>> {
     let mut offset = 0;
 
@@ -850,11 +822,11 @@ fn apply_delta(base: &[u8], delta: &[u8]) -> io::Result<Vec<u8>> {
         offset += 1;
 
         if cmd & 0x80 != 0 {
-            // Copy from base
+            // Copy command: copy bytes from base object
             let mut copy_offset = 0usize;
             let mut copy_size = 0usize;
 
-            // Read offset
+            // Read offset (up to 4 bytes)
             if cmd & 0x01 != 0 {
                 copy_offset |= delta[offset] as usize;
                 offset += 1;
@@ -872,7 +844,7 @@ fn apply_delta(base: &[u8], delta: &[u8]) -> io::Result<Vec<u8>> {
                 offset += 1;
             }
 
-            // Read size
+            // Read size (up to 3 bytes)
             if cmd & 0x10 != 0 {
                 copy_size |= delta[offset] as usize;
                 offset += 1;
@@ -887,10 +859,10 @@ fn apply_delta(base: &[u8], delta: &[u8]) -> io::Result<Vec<u8>> {
             }
 
             if copy_size == 0 {
-                copy_size = 0x10000;
+                copy_size = 0x10000; // Default size when not specified
             }
 
-            // Copy from base
+            // Validate and copy from base
             if copy_offset + copy_size > base.len() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -904,7 +876,7 @@ fn apply_delta(base: &[u8], delta: &[u8]) -> io::Result<Vec<u8>> {
             }
             result.extend_from_slice(&base[copy_offset..copy_offset + copy_size]);
         } else if cmd != 0 {
-            // Insert new data
+            // Insert command: insert new data from delta
             let insert_size = cmd as usize;
             if offset + insert_size > delta.len() {
                 return Err(io::Error::new(
@@ -923,6 +895,7 @@ fn apply_delta(base: &[u8], delta: &[u8]) -> io::Result<Vec<u8>> {
         }
     }
 
+    // Verify result size
     if result.len() != result_size {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -937,6 +910,76 @@ fn apply_delta(base: &[u8], delta: &[u8]) -> io::Result<Vec<u8>> {
     Ok(result)
 }
 
+// ============================================================================
+// OBJECT STORAGE
+// ============================================================================
+
+/// Store an object in the Git object database
+fn store_object(obj_type: &PackObjectType, data: &[u8]) -> io::Result<String> {
+    let header = format!("{} {}\0", obj_type.as_str(), data.len());
+    let mut full_object = Vec::new();
+    full_object.extend_from_slice(header.as_bytes());
+    full_object.extend_from_slice(data);
+
+    store_raw_object(&full_object)
+}
+
+/// Store raw object data (with header) in the Git object database
+fn store_raw_object(data: &[u8]) -> io::Result<String> {
+    // Calculate SHA1 hash
+    let mut hasher = Sha1::new();
+    hasher.update(data);
+    let sha = hasher.digest().to_string();
+
+    // Create object directory and file path
+    let dir = format!(".git/objects/{}", &sha[..2]);
+    fs::create_dir_all(&dir)?;
+    let path = format!("{}/{}", dir, &sha[2..]);
+
+    // Compress and write object
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(data)?;
+    let compressed = encoder.finish()?;
+
+    fs::write(&path, compressed)?;
+
+    Ok(sha)
+}
+
+/// Read an object from the Git object database (content only, no header)
+fn read_object_raw(sha: &str) -> io::Result<Vec<u8>> {
+    let path = format!(".git/objects/{}/{}", &sha[..2], &sha[2..]);
+    let compressed = fs::read(&path)?;
+
+    let mut decoder = ZlibDecoder::new(&compressed[..]);
+    let mut decompressed = Vec::new();
+    decoder.read_to_end(&mut decompressed)?;
+
+    // Find null byte to skip header
+    let null_pos = decompressed
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid object format"))?;
+
+    Ok(decompressed[null_pos + 1..].to_vec())
+}
+
+/// Read a complete Git object by SHA (including header)
+fn read_git_object(sha: &str) -> io::Result<Vec<u8>> {
+    let path = format!(".git/objects/{}/{}", &sha[..2], &sha[2..]);
+    let compressed = fs::read(&path)?;
+
+    let mut decoder = ZlibDecoder::new(&compressed[..]);
+    let mut decompressed = Vec::new();
+    decoder.read_to_end(&mut decompressed)?;
+
+    Ok(decompressed)
+}
+
+// ============================================================================
+// FILE CHECKOUT
+// ============================================================================
+
 /// Checkout files from the repository
 fn checkout_files(head_sha: &str) -> io::Result<()> {
     // Read the commit object
@@ -950,18 +993,6 @@ fn checkout_files(head_sha: &str) -> io::Result<()> {
     checkout_tree(&tree_sha, Path::new("."))?;
 
     Ok(())
-}
-
-/// Read a Git object by SHA
-fn read_git_object(sha: &str) -> io::Result<Vec<u8>> {
-    let path = format!(".git/objects/{}/{}", &sha[..2], &sha[2..]);
-    let compressed = fs::read(&path)?;
-
-    let mut decoder = ZlibDecoder::new(&compressed[..]);
-    let mut decompressed = Vec::new();
-    decoder.read_to_end(&mut decompressed)?;
-
-    Ok(decompressed)
 }
 
 /// Parse commit object to extract tree SHA
@@ -1055,10 +1086,9 @@ fn checkout_tree(tree_sha: &str, base_path: &Path) -> io::Result<()> {
 
             fs::write(&entry_path, content)?;
 
-            // Set executable permission if needed (for Unix-like systems)
+            // Set executable permission if needed (Unix-like systems only)
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
                 if mode == "100755" {
                     let mut perms = fs::metadata(&entry_path)?.permissions();
                     perms.set_mode(0o755);
